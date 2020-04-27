@@ -1,0 +1,203 @@
+#setwd('/Users/shivikakbisen/Desktop/Final_project')
+#getwd()
+#install.packages('doMC')
+
+set.seed(100000)
+library(ggplot2)
+library(plyr)
+library(reshape2)
+library(pomp)
+library(tseries)
+library(doParallel)
+library(foreach)
+library(doMC)
+
+data = read.csv("rate.csv")
+data$Rate = as.numeric(as.character(data$Rate))
+
+#Remove na
+dt = na.omit(data)
+plot(ts(dt$Rate,start = 2000, end = 2020, deltat = 1/260), main="Time Series Plot for GBP/USD from 2000 to April 15 2020",xlab="Year",ylab = 'Exchange Rate',type = 'l')
+
+# Take the data subset with 300 samples
+dt2 = dt[2601:2900,]
+dt2$Date=1:300
+fx = pomp(dt2,times="Date",t0=0)
+
+plot(fx, xlab = 'time from 0 to 300', main = 'GBP/USD Exchagne Rate')
+
+## Geometric Brownian Motion (GBM) Model
+# pomp
+dmeas <- Csnippet("lik = dnorm(Rate,0,N,give_log);")
+rmeas <- Csnippet("Rate = rnorm(0,N);")
+Ne_initializer <- "
+N=rpois(1.5);
+e=rpois(1);"
+
+stochStep <- Csnippet("e = rnorm(0,sigma);N = N*exp((mu-delta*delta/2)/260+delta/sqrt(260)*e);")
+
+stopifnot(packageVersion("pomp")>="0.75-1")
+pomp(data = dt2,
+     times="Date",
+     t0=0,
+     rprocess=discrete_time(step.fun=stochStep,delta.t=1),
+     rmeasure = rmeas,
+     dmeasure=dmeas, 
+     obsnames = "Rate",
+     paramnames=c("mu","delta","sigma"),
+     statenames=c("N","e"),
+     initializer=Csnippet(Ne_initializer)) -> fx
+
+#Set run level
+run_level = 3
+level_Np = c(100,1000,5000)
+level_Nmif = c(10,100,300)
+level_Nreps_eval = c(4,10,20)
+level_Nreps_local = c(10,20,20)
+level_Nreps_global = c(10,20,100)
+
+#likelihood Slice
+
+sliceDesign(
+  c(mu=0.1,delta=0.2,sigma=0.4),
+  mu=rep(seq(from=-10,to=10,length=40),each=3),
+  delta=rep(seq(from=0.1,to=3,length=40),each=3),
+  sigma=rep(seq(from=0.1,to=3,length=40),each=3)
+) -> p
+
+registerDoMC(cores=5)
+set.seed(998468235L,kind="L'Ecuyer")
+mcopts <- list(preschedule=FALSE,set.seed=TRUE)
+
+foreach (theta=iter(p,"row"),.combine=rbind,
+         .inorder=FALSE,.options.multicore=mcopts) %dopar% 
+         {
+           pfilter(fx,params=unlist(theta),Np=5000) -> pf
+           pf
+           theta$loglik <- logLik(pf)
+           theta
+         } -> p
+
+v = "mu"
+x <- subset(p,slice==v)
+plot(x[[v]],x$loglik,xlab=v,ylab="loglik",main='slicing for mu')
+
+v = "delta"
+x <- subset(p,slice==v)
+plot(x[[v]],x$loglik,xlab=v,ylab="loglik",main='slicing for delta')
+
+v = "sigma"
+x <- subset(p,slice==v)
+plot(x[[v]],x$loglik,xlab=v,ylab="loglik",main='slicing for sigma')
+
+
+# Partical Filter
+test = c(N.0=1.5,e.0=0,mu=0,delta=0.7,sigma=1.4)
+registerDoParallel()
+stew(file=sprintf("pf1.rda",run_level),{
+  t.pf1 <- system.time(
+    pf1 <- foreach(i=1:level_Nreps_eval[run_level],.packages='pomp',
+                   .options.multicore=list(set.seed=TRUE)) %dopar% try(
+                     pfilter(fx,params=test,
+                             Np=level_Np[run_level])
+                   )
+  )
+},seed=493536993,kind="L'Ecuyer")
+logmeanexp(sapply(pf1,logLik),se=TRUE)
+
+# Iterated Filtering on Data
+## Maximization and Likelihood Evaluation
+
+fx.sd_rp <- 0.002
+fx.sd_ivp <- 0.1
+fx_cooling.fraction.50 <- 0.1
+stew("mif1.rda",{
+  t.if1 <- system.time({
+    if1 <- foreach(i=1:level_Nreps_local[run_level],
+                   .packages='pomp', .combine=c,
+                   .options.multicore=list(set.seed=TRUE)) %dopar% try(
+                     mif2(fx,
+                          start=test,
+                          Np=level_Np[run_level],
+                          Nmif=level_Nmif[run_level],
+                          cooling.type="geometric",
+                          cooling.fraction.50=fx_cooling.fraction.50,
+                          transform=TRUE,
+                          rw.sd = rw.sd(
+                            mu = fx.sd_rp,
+                            delta = fx.sd_rp,
+                            sigma = fx.sd_rp
+                          )
+                     )
+                   )
+    
+    L.if1 <- foreach(i=1:level_Nreps_local[run_level],.packages='pomp',
+                     .combine=rbind,.options.multicore=list(set.seed=TRUE)) %dopar% 
+                     {
+                       logmeanexp(
+                         replicate(level_Nreps_eval[run_level],
+                                   logLik(pfilter(fx,params=coef(if1[[i]]),Np=level_Np[run_level]))
+                         ),
+                         se=TRUE)
+                     }
+  })
+},seed=318817883,kind="L'Ecuyer")
+r.if1 <- data.frame(logLik=L.if1[,1],logLik_se=L.if1[,2],t(sapply(if1,coef)))
+if (run_level>1) 
+  write.table(r.if1,file="fx_params.csv",append=TRUE,col.names=FALSE,row.names=FALSE)
+summary(r.if1$logLik,digits=5)
+
+
+## Likelihood Surface Evaluation
+pairs(~logLik+mu+delta+sigma,data=subset(r.if1,logLik>max(logLik)-20))
+
+# Global Search with Randomized Starting Values
+## Iterated Filtering with randomized starting values
+
+fx_box <- rbind(
+  mu = c(-5,10),
+  delta = c(0.1,1.5),
+  sigma = c(0.5,3)
+)
+
+stew(file="box_eval.rda",{
+  t.box <- system.time({
+    if.box <- foreach(i=1:level_Nreps_global[run_level],.packages='pomp',.combine=c,
+                      .options.multicore=list(set.seed=TRUE)) %dopar%  
+      mif2(
+        if1[[1]],
+        start=apply(fx_box,1,function(x)runif(1,x))
+      )
+    
+    L.box <- foreach(i=1:level_Nreps_global[run_level],.packages='pomp',.combine=rbind,
+                     .options.multicore=list(set.seed=TRUE)) %dopar% {
+                       set.seed(87932+i)
+                       logmeanexp(
+                         replicate(level_Nreps_eval[run_level],
+                                   logLik(pfilter(fx,params=coef(if.box[[i]]),Np=level_Np[run_level]))
+                         ), 
+                         se=TRUE)
+                     }
+  })
+},seed=290860873,kind="L'Ecuyer")
+
+
+r.box <- data.frame(logLik=L.box[,1],logLik_se=L.box[,2],t(sapply(if.box,coef)))
+if(run_level>1) write.table(r.box,file="fx2_params.csv",append=TRUE,col.names=FALSE,row.names=FALSE)
+summary(r.box$logLik,digits=5)
+
+## Global Geometry of the likelihood surface
+pairs(~logLik+mu+delta+sigma,data=subset(r.box,logLik>max(logLik)-10))
+
+## Log Likelihood
+fxg = garch(dt2$Rate,order = c(0,1),coef = NULL, itmax = 200,eps=NULL, grad = c("analytic"))
+logLik(fxg)
+
+## Diagnose Plots
+par(mfrow=c(1,2))
+qqnorm(fxg$residuals)
+qqline(fxg$residuals)
+acf(fxg$residuals, na.action=na.pass)
+par(mfrow=c(1,1))
+
+
